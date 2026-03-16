@@ -1,0 +1,13 @@
+{
+  "name": "02_02_hybrid_rag",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env app.js",
+    "dev": "node --env-file=.env --watch app.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^11.8.1",
+    "sqlite-vec": "^0.1.6"
+  }
+}

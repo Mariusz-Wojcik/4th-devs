@@ -157,3 +157,17 @@ Install dependencies:
 ```bash
 npm run lesson6:install
 ```
+
+## Lesson 07
+
+| Example | Run | Description |
+|---------|-----|-------------|
+| `02_02_chunking` | `npm run lesson7:chunking` | Four text chunking strategies compared side-by-side |
+| `02_02_embedding` | `npm run lesson7:embedding` | Interactive embedding demo with a pairwise similarity matrix |
+| `02_02_hybrid_rag` | `npm run lesson7:hybrid_rag` | Hybrid RAG agent with SQLite FTS5 full-text search and sqlite-vec vector similarity |
+
+Install dependencies:
+
+```bash
+npm run lesson7:install
+```

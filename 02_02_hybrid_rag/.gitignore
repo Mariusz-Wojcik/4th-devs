@@ -1,0 +1,12 @@
+node_modules/
+.env
+data/
+workspace/output/*.png
+workspace/output/*.jpg
+workspace/output/*.jpeg
+workspace/output/*.webp
+workspace/prompts/*.json
+workspace/input/*.png
+workspace/input/*.jpg
+workspace/input/*.jpeg
+workspace/input/*.webp
