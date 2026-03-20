@@ -2,7 +2,7 @@
 
 - Name: Adam
 - Location: Poland
-- Profession: Developer
+- Role: Developer
 - Company: easy_
 - Company focus: AI-powered automation tools
 - Favorite programming language: TypeScript

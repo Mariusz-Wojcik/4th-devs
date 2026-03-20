@@ -14,136 +14,48 @@
 import type OpenAI from 'openai'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
-import type { Message, Session } from '../types.js'
+import type { Message, Session, CalibrationState, MemoryConfig, ProcessedContext } from '../types.js'
 import { isFunctionCallOutput } from '../types.js'
 import { estimateTokens, estimateMessagesTokensRaw, estimateMessageTokens } from '../tokens.js'
 import { runObserver } from './observer.js'
 import { runReflector } from './reflector.js'
-import { resolveModelForProvider } from '../config.js'
-
-const WORKSPACE = join(process.cwd(), 'workspace')
-const MEMORY_DIR = join(WORKSPACE, 'memory')
-
-export interface MemoryConfig {
-  observationThresholdTokens: number
-  reflectionThresholdTokens: number
-  reflectionTargetTokens: number
-  observerModel: string
-  reflectorModel: string
-}
-
-// Thresholds are intentionally low so the observer/reflector cycle
-// triggers within a short demo conversation. In production you'd
-// raise these significantly (e.g. 4000 / 2000 / 1200).
-export const DEFAULT_MEMORY_CONFIG: MemoryConfig = {
-  observationThresholdTokens: 400,
-  reflectionThresholdTokens: 400,
-  reflectionTargetTokens: 200,
-  observerModel: 'gpt-4.1-mini',
-  reflectorModel: 'gpt-4.1-mini',
-}
-
-export interface ProcessedContext {
-  systemPrompt: string
-  messages: Message[]
-}
-
-const CONTINUATION_HINT = [
-  '<system-reminder>',
-  'Conversation history was compressed into memory observations.',
-  'Continue naturally. Do not mention memory mechanics.',
-  '</system-reminder>',
-].join('\n')
+import { MEMORY_DIR, resolveModelForProvider, DEFAULT_MEMORY_CONFIG } from '../config.js'
+import { log, logError } from '../log.js'
+import { CONTINUATION_HINT, buildObservationAppendix } from './prompts.js'
 
 // ============================================================================
 // File persistence
 // ============================================================================
 
-let observerLogCounter = 0
-let reflectorLogCounter = 0
-
 const pad = (n: number): string => String(n).padStart(3, '0')
 
-const persistObserverLog = async (
-  sessionId: string,
-  observations: string,
-  tokens: number,
-  messagesObserved: number,
-  generation: number,
-  sealedRange: [number, number],
+const persistMemoryLog = async (
+  prefix: string,
+  seq: number,
+  body: string,
+  metadata: Record<string, string | number>,
 ): Promise<void> => {
-  observerLogCounter += 1
-  const filename = `observer-${pad(observerLogCounter)}.md`
+  const filename = `${prefix}-${pad(seq)}.md`
   const path = join(MEMORY_DIR, filename)
-  const content = [
-    '---',
-    `type: observation`,
-    `session: ${sessionId}`,
-    `sequence: ${observerLogCounter}`,
-    `generation: ${generation}`,
-    `tokens: ${tokens}`,
-    `messages_observed: ${messagesObserved}`,
-    `sealed_range: ${sealedRange[0]}–${sealedRange[1]}`,
-    `created: ${new Date().toISOString()}`,
-    '---',
-    '',
-    observations,
-    '',
-  ].join('\n')
+
+  const frontmatter = Object.entries(metadata)
+    .map(([key, value]) => `${key}: ${value}`)
+    .join('\n')
+
+  const content = `---\n${frontmatter}\ncreated: ${new Date().toISOString()}\n---\n\n${body}\n`
 
   try {
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, content, 'utf-8')
-    console.log(`  [memory] 💾 ${filename}`)
-  } catch { /* best-effort */ }
-}
-
-const persistReflectorLog = async (
-  sessionId: string,
-  observations: string,
-  tokens: number,
-  generation: number,
-  compressionLevel: number,
-): Promise<void> => {
-  reflectorLogCounter += 1
-  const filename = `reflector-${pad(reflectorLogCounter)}.md`
-  const path = join(MEMORY_DIR, filename)
-  const content = [
-    '---',
-    `type: reflection`,
-    `session: ${sessionId}`,
-    `sequence: ${reflectorLogCounter}`,
-    `generation: ${generation}`,
-    `tokens: ${tokens}`,
-    `compression_level: ${compressionLevel}`,
-    `created: ${new Date().toISOString()}`,
-    '---',
-    '',
-    observations,
-    '',
-  ].join('\n')
-
-  try {
-    await mkdir(dirname(path), { recursive: true })
-    await writeFile(path, content, 'utf-8')
-    console.log(`  [memory] 💾 ${filename}`)
-  } catch { /* best-effort */ }
+    log('memory', `💾 ${filename}`)
+  } catch (err) {
+    logError('memory', `Failed to write ${filename}:`, err)
+  }
 }
 
 // ============================================================================
 // Context shaping helpers
 // ============================================================================
-
-const buildObservationAppendix = (observations: string): string => [
-  'The following observations are your memory of past conversations with this user.',
-  '',
-  '<observations>',
-  observations,
-  '</observations>',
-  '',
-  'IMPORTANT: Reference specific details from these observations when relevant.',
-  'When observations conflict, prefer the most recent one.',
-].join('\n')
 
 /**
  * Split messages into head (to observe) and tail (to keep as raw context).
@@ -153,12 +65,13 @@ const buildObservationAppendix = (observations: string): string => [
 const splitByTailBudget = (
   messages: Message[],
   tailBudget: number,
+  calibration?: CalibrationState,
 ): { head: Message[]; tail: Message[] } => {
   let tailTokens = 0
   let splitIndex = messages.length
 
   for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const tokens = estimateMessageTokens(messages[i])
+    const tokens = estimateMessageTokens(messages[i], calibration)
     if (tailTokens + tokens > tailBudget && splitIndex < messages.length) break
     tailTokens += tokens
     splitIndex = i
@@ -188,7 +101,7 @@ const runObservation = async (
   const unobserved = messages.slice(memory.lastObservedIndex)
 
   const tailBudget = Math.max(120, Math.floor(config.observationThresholdTokens * 0.3))
-  const { head } = splitByTailBudget(unobserved, tailBudget)
+  const { head } = splitByTailBudget(unobserved, tailBudget, memory.calibration)
   const toObserve = head.length > 0 ? head : unobserved
 
   const observed = await runObserver(openai, resolveModelForProvider(config.observerModel) as string, memory.activeObservations, toObserve)
@@ -202,20 +115,22 @@ const runObservation = async (
   memory.lastObservedIndex = head.length > 0
     ? memory.lastObservedIndex + head.length
     : messages.length
-  memory.observationTokenCount = estimateTokens(memory.activeObservations)
+  memory.observationTokenCount = estimateTokens(memory.activeObservations, memory.calibration)
 
   const sealed = memory.lastObservedIndex - prevIndex
-  console.log(`  [memory] Sealed ${sealed} messages (indices ${prevIndex}–${memory.lastObservedIndex - 1})`)
-  console.log(`  [memory] Thread: ${memory.lastObservedIndex} sealed | ${messages.length - memory.lastObservedIndex} active`)
+  log('memory', `Sealed ${sealed} messages (indices ${prevIndex}–${memory.lastObservedIndex - 1})`)
+  log('memory', `Thread: ${memory.lastObservedIndex} sealed | ${messages.length - memory.lastObservedIndex} active`)
 
-  await persistObserverLog(
-    session.id,
-    observed.observations,
-    estimateTokens(observed.observations),
-    toObserve.length,
-    memory.generationCount,
-    [prevIndex, memory.lastObservedIndex - 1],
-  )
+  memory.observerLogSeq += 1
+  await persistMemoryLog('observer', memory.observerLogSeq, observed.observations, {
+    type: 'observation',
+    session: session.id,
+    sequence: memory.observerLogSeq,
+    generation: memory.generationCount,
+    tokens: estimateTokens(observed.observations, memory.calibration),
+    messages_observed: toObserve.length,
+    sealed_range: `${prevIndex}–${memory.lastObservedIndex - 1}`,
+  })
 
   return { contextHint: { currentTask: observed.currentTask, suggestedResponse: observed.suggestedResponse } }
 }
@@ -227,13 +142,14 @@ const runReflection = async (
 ): Promise<void> => {
   const { memory } = session
 
-  console.log(`  [memory] Reflecting (${memory.observationTokenCount} > ${config.reflectionThresholdTokens})`)
+  log('memory', `Reflecting (${memory.observationTokenCount} > ${config.reflectionThresholdTokens})`)
 
   const reflected = await runReflector(
     openai,
     resolveModelForProvider(config.reflectorModel) as string,
     memory.activeObservations,
     config.reflectionTargetTokens,
+    memory.calibration,
   )
 
   memory.activeObservations = reflected.observations
@@ -241,13 +157,15 @@ const runReflection = async (
   memory._lastReflectionOutputTokens = reflected.tokenCount
   memory.generationCount += 1
 
-  await persistReflectorLog(
-    session.id,
-    reflected.observations,
-    reflected.tokenCount,
-    memory.generationCount,
-    reflected.compressionLevel,
-  )
+  memory.reflectorLogSeq += 1
+  await persistMemoryLog('reflector', memory.reflectorLogSeq, reflected.observations, {
+    type: 'reflection',
+    session: session.id,
+    sequence: memory.reflectorLogSeq,
+    generation: memory.generationCount,
+    tokens: reflected.tokenCount,
+    compression_level: reflected.compressionLevel,
+  })
 }
 
 // ============================================================================
@@ -274,39 +192,32 @@ export const processMemory = async (
   const pendingTokens = estimateMessagesTokensRaw(unobserved)
   const hasObservations = memory.activeObservations.length > 0
 
-  console.log(
-    `  [memory] Pending: ${pendingTokens} tokens (${unobserved.length} msgs) | Observations: ${memory.observationTokenCount} tokens (gen ${memory.generationCount})`,
-  )
+  log('memory', `Pending: ${pendingTokens} tokens (${unobserved.length} msgs) | Observations: ${memory.observationTokenCount} tokens (gen ${memory.generationCount})`)
 
-  // --- Below threshold ---
+  const passthroughContext = (): ProcessedContext => ({
+    systemPrompt: hasObservations
+      ? `${baseSystemPrompt}\n\n${buildObservationAppendix(memory.activeObservations)}`
+      : baseSystemPrompt,
+    messages: hasObservations ? unobserved : messages,
+  })
+
   if (pendingTokens < config.observationThresholdTokens) {
-    return {
-      systemPrompt: hasObservations
-        ? `${baseSystemPrompt}\n\n${buildObservationAppendix(memory.activeObservations)}`
-        : baseSystemPrompt,
-      messages: hasObservations ? unobserved : messages,
-    }
+    return passthroughContext()
   }
 
-  // --- Observer already ran this request (tool call turns) ---
   if (memory._observerRanThisRequest) {
-    console.log(`  [memory] Observer already ran this request, skipping`)
-    return {
-      systemPrompt: hasObservations
-        ? `${baseSystemPrompt}\n\n${buildObservationAppendix(memory.activeObservations)}`
-        : baseSystemPrompt,
-      messages: hasObservations ? unobserved : messages,
-    }
+    log('memory', `Observer already ran this request, skipping`)
+    return passthroughContext()
   }
 
   // --- Observation ---
-  console.log(`  [memory] Threshold exceeded (${pendingTokens} >= ${config.observationThresholdTokens}), running observer`)
+  log('memory', `Threshold exceeded (${pendingTokens} >= ${config.observationThresholdTokens}), running observer`)
 
   try {
     await runObservation(openai, session, config)
     memory._observerRanThisRequest = true
   } catch (err) {
-    console.error('  [memory] Observer failed:', err instanceof Error ? err.message : err)
+    logError('memory', 'Observer failed:', err)
     return { systemPrompt: baseSystemPrompt, messages }
   }
 
@@ -319,10 +230,10 @@ export const processMemory = async (
     try {
       await runReflection(openai, session, config)
     } catch (err) {
-      console.error('  [memory] Reflector failed:', err instanceof Error ? err.message : err)
+      logError('memory', 'Reflector failed:', err)
     }
   } else if (memory.observationTokenCount > config.reflectionThresholdTokens) {
-    console.log(`  [memory] Skipping reflection (grew ${grewSinceReflection} tokens since last, need ${config.reflectionTargetTokens})`)
+    log('memory', `Skipping reflection (grew ${grewSinceReflection} tokens since last, need ${config.reflectionTargetTokens})`)
   }
 
   // --- Return reshaped context ---
@@ -331,7 +242,7 @@ export const processMemory = async (
     ? remaining
     : [{ role: 'user' as const, content: CONTINUATION_HINT }]
 
-  console.log(`  [memory] Context: ${finalMessages.length} active msgs + observations (gen ${memory.generationCount}) | ${memory.lastObservedIndex} sealed`)
+  log('memory', `Context: ${finalMessages.length} active msgs + observations (gen ${memory.generationCount}) | ${memory.lastObservedIndex} sealed`)
 
   return {
     systemPrompt: `${baseSystemPrompt}\n\n${buildObservationAppendix(memory.activeObservations)}`,
@@ -344,6 +255,7 @@ export const processMemory = async (
 // ============================================================================
 
 export const flushMemory = async (
+  openai: OpenAI,
   session: Session,
   config: MemoryConfig = DEFAULT_MEMORY_CONFIG,
 ): Promise<void> => {
@@ -351,8 +263,7 @@ export const flushMemory = async (
   const unobserved = messages.slice(memory.lastObservedIndex)
   if (unobserved.length === 0) return
 
-  const { openai } = await import('../config.js')
-  console.log(`  [flush] Observing ${unobserved.length} remaining messages`)
+  log('flush', `Observing ${unobserved.length} remaining messages`)
 
   await runObservation(openai, session, config)
 
@@ -360,7 +271,7 @@ export const flushMemory = async (
     try {
       await runReflection(openai, session, config)
     } catch (err) {
-      console.error('  [flush] Reflector failed:', err instanceof Error ? err.message : err)
+      logError('flush', 'Reflector failed:', err)
     }
   }
 }

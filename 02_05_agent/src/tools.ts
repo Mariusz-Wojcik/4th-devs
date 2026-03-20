@@ -1,8 +1,8 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { join, resolve, relative, dirname } from 'node:path'
-import type { Tool } from './types.js'
-
-const WORKSPACE = join(process.cwd(), 'workspace')
+import type { Tool, ResolvedTool } from './types.js'
+import { WORKSPACE } from './config.js'
+import { formatError } from './utils.js'
 
 const isPathSafe = (path: string): boolean => {
   const fullPath = resolve(join(WORKSPACE, path))
@@ -30,7 +30,7 @@ export const tools: Tool[] = [
       try {
         return await readFile(join(WORKSPACE, path), 'utf-8')
       } catch (err) {
-        return `Error: ${err instanceof Error ? err.message : String(err)}`
+        return `Error: ${formatError(err)}`
       }
     },
   },
@@ -58,7 +58,7 @@ export const tools: Tool[] = [
         await writeFile(fullPath, content, 'utf-8')
         return `Wrote ${path}`
       } catch (err) {
-        return `Error: ${err instanceof Error ? err.message : String(err)}`
+        return `Error: ${formatError(err)}`
       }
     },
   },
@@ -66,3 +66,22 @@ export const tools: Tool[] = [
 
 export const findTool = (name: string): Tool | undefined =>
   tools.find((t) => t.definition.name === name)
+
+export const resolveAgentTools = (toolNames: string[]): ResolvedTool[] => {
+  const resolved: ResolvedTool[] = []
+
+  for (const toolName of toolNames) {
+    const tool = tools.find((t) => t.definition.name === toolName)
+    if (!tool) continue
+
+    resolved.push({
+      type: 'function',
+      name: tool.definition.name,
+      description: tool.definition.description,
+      parameters: tool.definition.parameters,
+      strict: false,
+    })
+  }
+
+  return resolved
+}

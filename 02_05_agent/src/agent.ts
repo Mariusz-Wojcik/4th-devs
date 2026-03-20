@@ -2,18 +2,13 @@ import type OpenAI from 'openai'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import matter from 'gray-matter'
-import type { AgentTemplate, Message, Session } from './types.js'
-import { isFunctionCall } from './types.js'
-import { tools, findTool } from './tools.js'
-import { processMemory, DEFAULT_MEMORY_CONFIG } from './memory/processor.js'
-import { estimateMessagesTokens, recordActualUsage, getCalibration } from './tokens.js'
-import { openai, resolveModelForProvider } from './config.js'
-
-const MAX_TURNS = 25
-const WORKSPACE = join(process.cwd(), 'workspace')
-
-const truncate = (s: string, max = 100): string =>
-  s.length > max ? s.slice(0, max) + '…' : s
+import type { AgentResult, AgentTemplate, FunctionCallItem, ResponseOutputItem, Session } from './types.js'
+import { findTool, resolveAgentTools } from './tools.js'
+import { processMemory } from './memory/processor.js'
+import { estimateMessagesTokens, trackUsage, getCalibration } from './tokens.js'
+import { openai, resolveModelForProvider, WORKSPACE, AGENT_MAX_TURNS, DEFAULT_MEMORY_CONFIG } from './config.js'
+import { truncate, parseArgs, getMessageText, formatError } from './utils.js'
+import { log, logError } from './log.js'
 
 const loadAgent = async (name: string): Promise<AgentTemplate> => {
   const raw = await readFile(join(WORKSPACE, 'agents', `${name}.agent.md`), 'utf-8')
@@ -26,45 +21,65 @@ const loadAgent = async (name: string): Promise<AgentTemplate> => {
   }
 }
 
-export interface AgentResult {
-  response: string
-  usage: {
-    totalEstimatedTokens: number
-    totalActualTokens: number
-    calibration: ReturnType<typeof getCalibration>
-    turns: number
+const applyResponseOutput = (session: Session, output: ResponseOutputItem[]): FunctionCallItem[] => {
+  const pendingCalls: FunctionCallItem[] = []
+
+  for (const item of output) {
+    if (item.type === 'message') {
+      const text = getMessageText(item)
+      if (text) session.messages.push({ role: 'assistant', content: text })
+      continue
+    }
+
+    if (item.type === 'function_call') {
+      const call: FunctionCallItem = { type: 'function_call', call_id: item.call_id, name: item.name, arguments: item.arguments }
+      session.messages.push(call)
+      pendingCalls.push(call)
+    }
   }
+
+  return pendingCalls
+}
+
+const executeToolCall = async (session: Session, call: FunctionCallItem): Promise<void> => {
+  let args: Record<string, unknown>
+  try {
+    args = parseArgs(call.arguments)
+  } catch (err) {
+    logError('agent', `Tool: ${call.name} — bad arguments:`, err)
+    session.messages.push({ type: 'function_call_output', call_id: call.call_id, output: `Error parsing arguments: ${formatError(err)}` })
+    return
+  }
+
+  log('agent', `Tool: ${call.name}(${truncate(JSON.stringify(args))})`)
+
+  const tool = findTool(call.name)
+  const output = tool ? await tool.handler(args) : `Unknown tool: ${call.name}`
+  session.messages.push({ type: 'function_call_output', call_id: call.call_id, output })
 }
 
 export const runAgent = async (session: Session, userMessage: string): Promise<AgentResult> => {
   const template = await loadAgent('alice')
+  const model = resolveModelForProvider(template.model) as string
+  const responsesTools = resolveAgentTools(template.tools)
+  const cal = session.memory.calibration
 
   session.messages.push({ role: 'user', content: userMessage })
   session.memory._observerRanThisRequest = false
 
-  const agentTools = template.tools
-    .map((name) => tools.find((t) => t.definition.name === name))
-    .filter((t): t is NonNullable<typeof t> => t != null)
+  const totals = { estimated: 0, actual: 0 }
 
-  const responsesTools: OpenAI.Responses.Tool[] = agentTools.map((t) => ({
-    type: 'function' as const,
-    name: t.definition.name,
-    description: t.definition.description,
-    parameters: t.definition.parameters,
-    strict: false,
-  }))
+  const buildUsage = (turns: number): AgentResult['usage'] => ({
+    totalEstimatedTokens: totals.estimated,
+    totalActualTokens: totals.actual,
+    calibration: getCalibration(cal),
+    turns,
+  })
 
-  const model = resolveModelForProvider(template.model) as string
-  let totalEstimated = 0
-  let totalActual = 0
-
-  for (let turn = 0; turn < MAX_TURNS; turn += 1) {
+  for (let turn = 0; turn < AGENT_MAX_TURNS; turn += 1) {
     const context = await processMemory(openai, session, template.systemPrompt, DEFAULT_MEMORY_CONFIG)
-
-    const estimated = estimateMessagesTokens(context.messages)
-    totalEstimated += estimated.safe
-
-    console.log(`  [agent] Turn ${turn + 1}, ${context.messages.length} items (~${estimated.safe} tokens)`)
+    const estimated = estimateMessagesTokens(context.messages, cal)
+    log('agent', `Turn ${turn + 1}, ${context.messages.length} items (~${estimated.safe} tokens)`)
 
     const response = await openai.responses.create({
       model,
@@ -74,61 +89,22 @@ export const runAgent = async (session: Session, userMessage: string): Promise<A
       store: false,
     })
 
-    const usage = response.usage
-    if (usage) {
-      const actual = usage.input_tokens + usage.output_tokens
-      totalActual += actual
-      recordActualUsage(estimated.safe, actual)
-      console.log(`  [agent] API usage — estimated: ${estimated.safe}, actual: ${actual}`)
+    const actualTokens = trackUsage(response.usage ?? null, cal, estimated.safe, totals)
+    if (actualTokens !== null) {
+      log('agent', `API usage — estimated: ${estimated.safe}, actual: ${actualTokens}`)
     }
 
-    const functionCalls: Message[] = []
+    const pendingCalls = applyResponseOutput(session, response.output as ResponseOutputItem[])
 
-    for (const item of response.output) {
-      if (item.type === 'message') {
-        const text = item.content
-          .filter((c): c is OpenAI.Responses.ResponseOutputText => c.type === 'output_text')
-          .map((c) => c.text)
-          .join('')
-        if (text) {
-          session.messages.push({ role: 'assistant', content: text })
-        }
-      } else if (item.type === 'function_call') {
-        const fc: Message = { type: 'function_call', call_id: item.call_id, name: item.name, arguments: item.arguments }
-        session.messages.push(fc)
-        functionCalls.push(fc)
-      }
+    if (pendingCalls.length === 0) {
+      log('agent', `Done (${turn + 1} turns)`)
+      return { response: response.output_text ?? '', usage: buildUsage(turn + 1) }
     }
 
-    if (functionCalls.length === 0) {
-      console.log(`  [agent] Done (${turn + 1} turns)`)
-      return {
-        response: response.output_text ?? '',
-        usage: { totalEstimatedTokens: totalEstimated, totalActualTokens: totalActual, calibration: getCalibration(), turns: turn + 1 },
-      }
-    }
-
-    for (const fc of functionCalls) {
-      if (!isFunctionCall(fc)) continue
-
-      let args: Record<string, unknown> = {}
-      try {
-        args = JSON.parse(fc.arguments || '{}')
-      } catch {
-        args = {}
-      }
-
-      console.log(`  [agent] Tool: ${fc.name}(${truncate(JSON.stringify(args))})`)
-
-      const tool = findTool(fc.name)
-      const result = tool ? await tool.handler(args) : `Unknown tool: ${fc.name}`
-
-      session.messages.push({ type: 'function_call_output', call_id: fc.call_id, output: result })
+    for (const call of pendingCalls) {
+      await executeToolCall(session, call)
     }
   }
 
-  return {
-    response: 'Exceeded maximum turns',
-    usage: { totalEstimatedTokens: totalEstimated, totalActualTokens: totalActual, calibration: getCalibration(), turns: MAX_TURNS },
-  }
+  return { response: 'Exceeded maximum turns', usage: buildUsage(AGENT_MAX_TURNS) }
 }
